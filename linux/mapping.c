@@ -235,44 +235,41 @@ void jdebug_mapping_print(const mapping_t* mapping, const logger_t* log)
   jdebug_log_format(log, "  0x%zX - 0x%zX [0x%zX] %s\n", mapping->s_addr, mapping->e_addr, mapping->offset, mapping->pathname);
 }
 
-static int jdebug_mapping_get_source_lines_die(Dwarf_Debug dbg, Dwarf_Die die, Dwarf_Error* err, size_t target_addr, char** source_file, uint64_t* source_line)
+static int jdebug_mapping_get_source_lines_die(const Dwarf_Debug dbg,
+                                               const Dwarf_Die die,
+                                               const size_t target_addr,
+                                               char** source_file,
+                                               uint64_t* source_line)
 {
-  int ret                 = -1;
+  Dwarf_Error err         = NULL;
   Dwarf_Unsigned version  = 0;
   Dwarf_Small table_count = 0;
-  Dwarf_Line_Context ctx  = 0;
-  Dwarf_Line* lines       = 0;
+  Dwarf_Line_Context ctx  = NULL;
+  Dwarf_Line* lines       = NULL;
   Dwarf_Signed line_count = 0;
-  Dwarf_Line best         = 0;
+  Dwarf_Line best         = NULL;
   Dwarf_Addr best_addr    = 0;
   char* src               = NULL;
   Dwarf_Unsigned lineno   = 0;
+  int ret                 = -1;
 
-  if (dwarf_srclines_b(die, &version, &table_count, &ctx, err) != DW_DLV_OK) {
-    return -1;
-  }
-
-  if (dwarf_srclines_from_linecontext(ctx, &lines, &line_count, err) != DW_DLV_OK) {
+  if (dwarf_srclines_b(die, &version, &table_count, &ctx, &err)
+      || dwarf_srclines_from_linecontext(ctx, &lines, &line_count, &err))
     goto done;
-  }
 
   for (Dwarf_Signed i = 0; i < line_count; i++) {
     Dwarf_Addr row_addr     = 0;
     Dwarf_Bool end_sequence = 0;
 
-    if (dwarf_lineaddr(lines[i], &row_addr, err) != DW_DLV_OK)
+    if (dwarf_lineaddr(lines[i], &row_addr, &err))
       continue;
 
-    dwarf_lineendsequence(lines[i], &end_sequence, err);
-
-    if (end_sequence) {
+    dwarf_lineendsequence(lines[i], &end_sequence, &err);
+    if (end_sequence)
       continue;
-    }
 
-    if (dwarf_linesrc(lines[i], &src, err) != DW_DLV_OK)
-      goto done;
-
-    if (dwarf_lineno(lines[i], &lineno, err) != DW_DLV_OK)
+    if (dwarf_linesrc(lines[i], &src, &err)
+        || dwarf_lineno(lines[i], &lineno, &err))
       goto done;
 
     if (row_addr <= target_addr && (!best || row_addr > best_addr)) {
@@ -281,18 +278,11 @@ static int jdebug_mapping_get_source_lines_die(Dwarf_Debug dbg, Dwarf_Die die, D
     }
   }
 
-  Dwarf_Addr row_addr;
-
-  if (!best)
-    goto done;
-
-  if (dwarf_lineaddr(best, &row_addr, err) != DW_DLV_OK)
-    goto done;
-
-  if (dwarf_linesrc(best, &src, err) != DW_DLV_OK)
-    goto done;
-
-  if (dwarf_lineno(best, &lineno, err) != DW_DLV_OK)
+  Dwarf_Addr row_addr = 0;
+  if (!best
+      || dwarf_lineaddr(best, &row_addr, &err)
+      || dwarf_linesrc(best, &src, &err)
+      || dwarf_lineno(best, &lineno, &err))
     goto done;
 
   *source_file = strdup(src);
@@ -300,38 +290,48 @@ static int jdebug_mapping_get_source_lines_die(Dwarf_Debug dbg, Dwarf_Die die, D
     goto done;
 
   *source_line = lineno;
-
-  ret = 0;
+  ret          = 1;
 
 done:
+  if (err)
+    dwarf_dealloc_error(dbg, err);
   if (src)
     dwarf_dealloc(dbg, src, DW_DLA_STRING);
   dwarf_srclines_dealloc_b(ctx);
   return ret;
 }
 
-static int jdebug_dwarf_die_in_low_high_pc(Dwarf_Die die, size_t target_addr, Dwarf_Error err)
+static int jdebug_dwarf_die_in_low_high_pc(const Dwarf_Debug dbg,
+                                           const Dwarf_Die die,
+                                           const size_t target_addr)
 {
+  Dwarf_Error err             = NULL;
   Dwarf_Addr lowpc            = 0;
   Dwarf_Addr highpc           = 0;
   Dwarf_Half form             = 0;
   enum Dwarf_Form_Class class = 0;
+  int ret                     = 0;
 
-  if (dwarf_lowpc(die, &lowpc, &err) != DW_DLV_OK)
-    return 0;
-
-  if (dwarf_highpc_b(die, &highpc, &form, &class, &err) != DW_DLV_OK)
-    return 0;
+  if (dwarf_lowpc(die, &lowpc, &err)
+      || dwarf_highpc_b(die, &highpc, &form, &class, &err))
+    goto done;
 
   if (class == DW_FORM_CLASS_CONSTANT)
     highpc += lowpc;
 
-  return lowpc <= target_addr && target_addr < highpc;
+  ret = lowpc <= target_addr && target_addr < highpc;
+
+done:
+  if (err)
+    dwarf_dealloc_error(dbg, err);
+  return ret;
 }
 
-static int jdebug_dwarf_die_in_ranges(Dwarf_Debug dbg, Dwarf_Die die, size_t target_addr, Dwarf_Error err)
+static int jdebug_dwarf_die_in_ranges(const Dwarf_Debug dbg,
+                                      const Dwarf_Die die,
+                                      const size_t target_addr)
 {
-  int ret                      = 0;
+  Dwarf_Error err              = NULL;
   Dwarf_Attribute attr         = NULL;
   Dwarf_Half form              = 0;
   Dwarf_Unsigned ranges_offset = 0;
@@ -341,19 +341,17 @@ static int jdebug_dwarf_die_in_ranges(Dwarf_Debug dbg, Dwarf_Die die, size_t tar
   Dwarf_Off real_offset        = 0;
   Dwarf_Bool have_base         = 0;
   Dwarf_Unsigned base          = 0;
+  int ret                      = 0;
 
-  if (dwarf_attr(die, DW_AT_ranges, &attr, &err) != DW_DLV_OK)
-    goto done;
-
-  if (dwarf_whatform(attr, &form, &err) != DW_DLV_OK)
+  if (dwarf_attr(die, DW_AT_ranges, &attr, &err)
+      || dwarf_whatform(attr, &form, &err))
     goto done;
 
   if (form == DW_FORM_sec_offset) {
-    if (dwarf_global_formref(attr, &ranges_offset, &err) != DW_DLV_OK)
+    if (dwarf_global_formref(attr, &ranges_offset, &err))
       goto done;
-  } else {
-    if (dwarf_formudata(attr, &ranges_offset, &err) != DW_DLV_OK)
-      goto done;
+  } else if (dwarf_formudata(attr, &ranges_offset, &err)) {
+    goto done;
   }
 
   if (dwarf_get_ranges_b(
@@ -364,8 +362,7 @@ static int jdebug_dwarf_die_in_ranges(Dwarf_Debug dbg, Dwarf_Die die, size_t tar
         &ranges,
         &range_count,
         &byte_count,
-        &err)
-      != DW_DLV_OK)
+        &err))
     goto done;
 
   for (Dwarf_Signed i = 0; i < range_count; i++) {
@@ -400,6 +397,8 @@ static int jdebug_dwarf_die_in_ranges(Dwarf_Debug dbg, Dwarf_Die die, size_t tar
   }
 
 done:
+  if (err)
+    dwarf_dealloc_error(dbg, err);
   if (attr)
     dwarf_dealloc_attribute(attr);
   if (ranges)
@@ -407,33 +406,33 @@ done:
   return ret;
 }
 
-static int jdebug_dwarf_die_in_rnglists(Dwarf_Die die, size_t target_addr, Dwarf_Error err)
+static int jdebug_dwarf_die_in_rnglists(const Dwarf_Debug dbg,
+                                        const Dwarf_Die die,
+                                        const size_t target_addr)
 {
-  int r                        = 0;
+  Dwarf_Error err              = NULL;
   Dwarf_Attribute attr         = NULL;
   Dwarf_Half form              = 0;
   Dwarf_Unsigned ranges_offset = 0;
   Dwarf_Rnglists_Head head     = NULL;
   Dwarf_Unsigned count         = 0;
   Dwarf_Unsigned offset        = 0;
+  int ret                      = 0;
 
-  if (dwarf_attr(die, DW_AT_ranges, &attr, &err) != DW_DLV_OK)
+  if (dwarf_attr(die, DW_AT_ranges, &attr, &err)
+      || dwarf_whatform(attr, &form, &err)) {
     goto done;
-
-  if (dwarf_whatform(attr, &form, &err) != DW_DLV_OK)
-    goto done;
-
-  if (form == DW_FORM_sec_offset) {
-    if (dwarf_global_formref(attr, &ranges_offset, &err) != DW_DLV_OK)
-      goto done;
-  } else {
-    if (dwarf_formudata(attr, &ranges_offset, &err) != DW_DLV_OK)
-      goto done;
   }
 
-  if (dwarf_rnglists_get_rle_head(attr, form, ranges_offset, &head, &count, &offset, &err) != DW_DLV_OK)
+  if (form == DW_FORM_sec_offset) {
+    if (dwarf_global_formref(attr, &ranges_offset, &err))
+      goto done;
+  } else if (dwarf_formudata(attr, &ranges_offset, &err)) {
     goto done;
+  }
 
+  if (dwarf_rnglists_get_rle_head(attr, form, ranges_offset, &head, &count, &offset, &err))
+    goto done;
 
   for (Dwarf_Unsigned i = 0; i < count; i++) {
     unsigned entrylen                 = 0;
@@ -454,77 +453,83 @@ static int jdebug_dwarf_die_in_rnglists(Dwarf_Die die, size_t target_addr, Dwarf
           &debug_addr_unavailable,
           &lowpc,
           &highpc,
-          &err)
-        != DW_DLV_OK)
+          &err))
       goto done;
 
     if (debug_addr_unavailable)
       continue;
 
     if (lowpc <= target_addr && target_addr < highpc) {
-      r = 1;
+      ret = 1;
       break;
     }
   }
 
 done:
+  if (err)
+    dwarf_dealloc_error(dbg, err);
   if (head)
     dwarf_dealloc_rnglists_head(head);
   if (attr)
     dwarf_dealloc_attribute(attr);
-  return r;
+  return ret;
 }
 
-static int jdebug_mapping_dwarf_die_in_range(Dwarf_Debug dbg, Dwarf_Die die, size_t target_addr, Dwarf_Error err)
+static int jdebug_mapping_dwarf_die_in_range(const Dwarf_Debug dbg,
+                                             const Dwarf_Die die,
+                                             const size_t target_addr)
 {
-  if (jdebug_dwarf_die_in_low_high_pc(die, target_addr, err))
-    return 1;
-
-  if (jdebug_dwarf_die_in_ranges(dbg, die, target_addr, err))
-    return 1;
-
-  if (jdebug_dwarf_die_in_rnglists(die, target_addr, err))
-    return 1;
-
-  return 0;
+  return jdebug_dwarf_die_in_low_high_pc(dbg, die, target_addr)
+         || jdebug_dwarf_die_in_ranges(dbg, die, target_addr)
+         || jdebug_dwarf_die_in_rnglists(dbg, die, target_addr);
 }
 
 int jdebug_mapping_get_source_file(const mapping_t* mapping, size_t target_addr, char** source_file, uint64_t* source_line)
 {
-  int ret            = -1;
   Dwarf_Debug dbg    = NULL;
   Dwarf_Error err    = NULL;
   Dwarf_Half version = 0;
+  int ret            = -1;
 
   *source_file = NULL;
   *source_line = 0;
 
-  if (dwarf_init_path(mapping->pathname, NULL, 0, DW_GROUPNUMBER_ANY, NULL, NULL, &dbg, &err) != DW_DLV_OK)
+  if (dwarf_init_path(mapping->pathname, NULL, 0, DW_GROUPNUMBER_ANY, NULL, NULL, &dbg, &err))
     goto done;
 
-  while (dwarf_next_cu_header_d(dbg, 1, NULL, &version, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &err) == DW_DLV_OK) {
+  while (!dwarf_next_cu_header_d(dbg,
+                                 1,
+                                 NULL,
+                                 &version,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 &err)) {
     Dwarf_Die die = NULL;
-
-    if (dwarf_siblingof_b(dbg, NULL, 1, &die, &err) != DW_DLV_OK)
+    if (dwarf_siblingof_b(dbg, NULL, 1, &die, &err))
       continue;
 
-    if (!jdebug_mapping_dwarf_die_in_range(dbg, die, target_addr, err)) {
+    if (!jdebug_mapping_dwarf_die_in_range(dbg, die, target_addr)) {
       dwarf_dealloc_die(die);
       continue;
     }
 
-    ret = jdebug_mapping_get_source_lines_die(dbg, die, &err, target_addr, source_file, source_line);
-
+    ret = jdebug_mapping_get_source_lines_die(dbg, die, target_addr, source_file, source_line);
     dwarf_dealloc_die(die);
 
-    if (!ret) {
+    if (!ret)
       break;
-    }
   }
 
 done:
   if (dbg) {
-    dwarf_dealloc_error(dbg, err);
+    if (err)
+      dwarf_dealloc_error(dbg, err);
     dwarf_finish(dbg);
   }
   return ret;

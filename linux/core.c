@@ -171,7 +171,6 @@ static int jdebug_coredump_prepare_offsets(coredump_state_t* state)
 
   const int auxv_fd = open(state->auxv_path, O_RDONLY);
   if (-1 == auxv_fd) {
-    perror("open auxv");
     return -1;
   }
 
@@ -640,12 +639,10 @@ static int jdebug_coredump_write_auxv(coredump_state_t* state)
   nhdr.n_type   = NT_AUXV;
 
   if (-1 == jdebug_coredump_do_write(state, &nhdr, sizeof(nhdr))) {
-    perror("write1");
     goto done;
   }
 
   if (-1 == jdebug_coredump_do_write(state, "CORE\0\0\0", 8)) {
-    perror("write2");
     goto done;
   }
 
@@ -653,7 +650,6 @@ static int jdebug_coredump_write_auxv(coredump_state_t* state)
   for (size_t i = 0; i < state->n_auxv; ++i) {
     Elf64_auxv_t aux;
     if (-1 == jdebug_read_all(auxv_fd, &aux, sizeof(aux), -1)) {
-      perror("read1");
       goto done;
     }
 
@@ -690,7 +686,6 @@ static int jdebug_coredump_write_string_table(coredump_state_t* state)
 static int jdebug_coredump_seek(coredump_state_t* state, size_t pos)
 {
   if (pos < state->n_wrote) {
-    fprintf(stderr, "invalid seek\n");
     return -1;
   }
 
@@ -706,7 +701,6 @@ static int jdebug_coredump_seek(coredump_state_t* state, size_t pos)
     if (-1 == wrote) {
       if (errno == EINTR)
         continue;
-      perror("splice");
       ret = -1;
       break;
     }

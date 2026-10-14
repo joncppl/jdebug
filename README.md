@@ -77,7 +77,7 @@ include(FetchContent)
 FetchContent_Declare(
     jdebug
     GIT_REPOSITORY https://github.com/joncppl/jdebug
-    GIT_TAG v0.1.0
+    GIT_TAG v0.1.1
 )
 FetchContent_MakeAvailable(jdebug)
 
@@ -93,7 +93,7 @@ A [wrap](https://mesonbuild.com/Wrap-dependency-system-manual.html) may be used.
 ```ini
 [wrap-git]
 url = https://github.com/joncppl/jdebug
-revision = 0.1.0
+revision = v0.1.1
 depth = 1
 
 [provide]

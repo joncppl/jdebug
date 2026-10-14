@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26)
-project(jdebug VERSION 0.1.0)
+project(jdebug VERSION 0.1.1)
 
 option(JDEBUG_ENABLE_CXX_EXCEPTION_PRINTER
         "Enable c++ exception printer (requires linking to c++ standard library)"

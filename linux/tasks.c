@@ -63,7 +63,7 @@ int jdebug_resume_tasks(jdebug_tasks_t* tasks)
 {
   struct timespec stime = {0, 100 * 1000 * 1000};
   int r;
-  while (((r = nanosleep(&stime, &stime))) && r == EINTR) {
+  while (((r = nanosleep(&stime, &stime))) && errno == EINTR) {
     /* no-op */
   }
 
