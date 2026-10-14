@@ -1,0 +1,22 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        exclude: '^.gitlab-ci.yml$'
+      - id: check-added-large-files
+      - id: mixed-line-ending
+        args: ['--fix', 'lf']
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v22.1.0
+    hooks:
+      - id: clang-format
+#  - repo: https://github.com/bjd2385/pre-commit-gitlabci-lint
+#    rev: v1.4.0
+#    hooks:
+#      - id: gitlabci-lint
+#        args: ['-p', '79543765']

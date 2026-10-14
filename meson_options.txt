@@ -1,0 +1,13 @@
+option(
+    'cxx_exceptions',
+    type : 'feature',
+    value : 'enabled',
+    description : 'Enable c++ exception printer (requires linking to c++ standard library)',
+)
+
+option(
+    'examples',
+    type : 'feature',
+    value : 'enabled',
+    description : 'Build the examples',
+)
