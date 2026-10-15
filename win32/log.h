@@ -29,5 +29,5 @@ extern "C"
   void jdebug_log_deinit(logger_t* logger);
 
 #ifdef __cplusplus
-};
+}
 #endif

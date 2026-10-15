@@ -77,7 +77,7 @@ static int jdebug_coredump_write_auxv(coredump_state_t* state);
 static int jdebug_coredump_write_string_table(coredump_state_t* state);
 static int jdebug_coredump_seek(coredump_state_t* state, size_t pos);
 static int jdebug_coredump_do_write(coredump_state_t* state, const void* buf, size_t len);
-static compressor_t jdebug_coredump_choose_compressor();
+static compressor_t jdebug_coredump_choose_compressor(void);
 static int jdebug_coredump_open_compressor(coredump_state_t* state);
 static int jdebug_coredump_close_compressor(coredump_state_t* state);
 
@@ -114,6 +114,7 @@ int jdebug_coredump_write(pid_t process,
   state->ucontext   = ucontext;
 
   state->page_size = page_size;
+  state->output_fd = -1;
 
   state->compressor = jdebug_coredump_choose_compressor();
 
@@ -153,7 +154,8 @@ static int jdebug_coredump_write_internal(coredump_state_t* state)
   ret = 0;
 
 done:
-  jdebug_coredump_close_compressor(state);
+  if (jdebug_coredump_close_compressor(state))
+    ret = -1;
   free(state->auxv_path);
   return ret;
 }
@@ -202,7 +204,7 @@ static int jdebug_coredump_prepare_offsets(coredump_state_t* state)
   }
 
   state->notes_start      = jdebug_round_up_power_of_2(data_cursor, state->page_size);
-  state->string_tab_start = data_cursor + state->notes_size;
+  state->string_tab_start = state->notes_start + state->notes_size;
 
   ret = 0;
 
@@ -268,10 +270,12 @@ static int jdebug_coredump_write_headers(coredump_state_t* state)
     data_cursor = jdebug_round_up_power_of_2(data_cursor, state->page_size);
     Elf64_Phdr phdr;
     phdr.p_type  = PT_LOAD;
-    phdr.p_flags = PF_R;
+    phdr.p_flags = 0;
+    if (mapping->access & MAPPING_ACCESS_READ)
+      phdr.p_flags |= PF_R;
     if (mapping->access & MAPPING_ACCESS_WRITE)
       phdr.p_flags |= PF_W;
-    if (mapping->access & MAPPING_ACCESS_READ)
+    if (mapping->access & MAPPING_ACCESS_EXEC)
       phdr.p_flags |= PF_X;
     phdr.p_offset = data_cursor;
     phdr.p_vaddr  = mapping->s_addr;
@@ -357,45 +361,46 @@ static int jdebug_coredump_write_headers(coredump_state_t* state)
 static int jdebug_coredump_write_data_sections(coredump_state_t* state)
 {
   int ret = -1;
-  int vm_pipe[2];
   size_t data_cursor;
 
-  if (-1 == pipe(vm_pipe)) {
+  // copy in fixed size chunks: mappings may be arbitrarily large (eg. reserved address space)
+  const size_t chunk_size = 1024 * 1024;
+  uint8_t* buf            = malloc(chunk_size);
+  if (!buf)
     return -1;
-  }
 
   data_cursor = state->data_start;
   jcontainer_ll_foreach(&state->mappings, mapping)
   {
     data_cursor               = jdebug_round_up_power_of_2(data_cursor, state->page_size);
     const size_t mapping_size = jdebug_mapping_size(mapping);
-    uint8_t* buf              = malloc(mapping_size);
 
-    const struct iovec local  = {buf, mapping_size};
-    const struct iovec remote = {(void*) mapping->s_addr, mapping_size};
-
-    ssize_t r = process_vm_readv(state->process, &local, 1, &remote, 1, 0);
-    if (-1 == r)
-      memset(buf, 0, mapping_size);
-
-    if (jdebug_coredump_seek(state, (long) data_cursor)) {
-      free(buf);
+    if (jdebug_coredump_seek(state, data_cursor))
       goto done;
-    }
 
-    if (jdebug_coredump_do_write(state, buf, mapping_size)) {
-      free(buf);
-      goto done;
+    for (size_t offset = 0; offset < mapping_size; offset += chunk_size) {
+      const size_t n = mapping_size - offset < chunk_size ? mapping_size - offset : chunk_size;
+
+      const struct iovec local  = {buf, n};
+      const struct iovec remote = {(void*) (mapping->s_addr + offset), n};
+
+      // unreadable memory (eg. guard pages) is written as zeros
+      ssize_t r = process_vm_readv(state->process, &local, 1, &remote, 1, 0);
+      if (r < 0)
+        r = 0;
+      if ((size_t) r < n)
+        memset(buf + r, 0, n - (size_t) r);
+
+      if (jdebug_coredump_do_write(state, buf, n))
+        goto done;
     }
-    free(buf);
 
     data_cursor += mapping_size;
   }
 
   ret = 0;
 done:
-  close(vm_pipe[0]);
-  close(vm_pipe[1]);
+  free(buf);
   return ret;
 }
 
@@ -414,6 +419,28 @@ static int jdebug_coredump_write_notes(coredump_state_t* state)
     return -1;
 
   return 0;
+}
+
+// reads up to (size - 1) bytes of /proc/<pid>/<name> into a nul terminated buffer,
+//  stripping a trailing newline. returns the number of bytes read, or -1
+static ssize_t jdebug_coredump_read_proc_file(pid_t pid, const char* name, char* buf, size_t size)
+{
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
+
+  memset(buf, 0, size);
+
+  const int fd = open(path, O_RDONLY);
+  if (-1 == fd)
+    return -1;
+
+  const ssize_t r = jdebug_read_all(fd, buf, size - 1, -1);
+  close(fd);
+
+  if (r > 0 && buf[r - 1] == '\n')
+    buf[r - 1] = '\0';
+
+  return r;
 }
 
 static int jdebug_coredump_write_prpsinfo(coredump_state_t* state)
@@ -450,18 +477,23 @@ static int jdebug_coredump_write_prpsinfo(coredump_state_t* state)
   size_t line_n = 0;
 
   while (getline(&line, &line_n, status_fp) > 0) {
-    char* c;
-    if ((c = strstr(line, "PPid:"))) {
-      info.pr_ppid = (int) strtol(c, NULL, 10);
-    } else if ((c = strstr(line, "Tgid:"))) {
-      info.pr_pgrp = (int) strtol(c, NULL, 10);
-    }
+    if (0 == strncmp(line, "PPid:", 5))
+      info.pr_ppid = (int) strtol(line + 5, NULL, 10);
   }
 
   free(line);
   fclose(status_fp);
 
-  info.pr_sid = getsid(state->process);
+  info.pr_pgrp = getpgid(state->process);
+  info.pr_sid  = getsid(state->process);
+
+  // executable name and command line, eg. shown by gdb as "Core was generated by ..."
+  jdebug_coredump_read_proc_file(state->process, "comm", info.pr_fname, sizeof(info.pr_fname));
+  const ssize_t args_len = jdebug_coredump_read_proc_file(state->process, "cmdline", info.pr_psargs, sizeof(info.pr_psargs));
+  for (ssize_t i = 0; i + 1 < args_len; ++i) {
+    if (info.pr_psargs[i] == '\0')
+      info.pr_psargs[i] = ' ';
+  }
 
   if (-1 == jdebug_coredump_do_write(state, &info, sizeof(info)))
     goto done;
@@ -477,9 +509,24 @@ static int jdebug_coredump_write_prstatus(coredump_state_t* state)
   int ret = -1;
 
   const int64_t clock_tick_per_sec = sysconf(_SC_CLK_TCK);
-  const int64_t ms_per_sec         = 1000 * 1000;
+  const int64_t us_per_sec         = 1000 * 1000;
+  char* line                       = NULL;
+  size_t line_n                    = 0;
 
+  // as with kernel core dumps, the crashing task is written first so debuggers select it by default
+  size_t crash_task_i = 0;
   for (size_t task_i = 0; task_i < state->n_tasks; ++task_i) {
+    if (state->tasks[task_i] == state->crash_task)
+      crash_task_i = task_i;
+  }
+
+  for (size_t order_i = 0; order_i < state->n_tasks; ++order_i) {
+    size_t task_i = order_i;
+    if (order_i == 0)
+      task_i = crash_task_i;
+    else if (order_i <= crash_task_i)
+      task_i = order_i - 1;
+
     const pid_t task = state->tasks[task_i];
     Elf64_Nhdr nhdr;
     nhdr.n_namesz = 5;
@@ -497,6 +544,7 @@ static int jdebug_coredump_write_prstatus(coredump_state_t* state)
     status.pr_info.si_errno    = state->siginfo->si_errno;
     status.pr_cursig           = state->siginfo->si_signo;
     status.pr_pid              = task;
+    status.pr_pgrp             = getpgid(state->process);
     status.pr_sid              = getsid(state->process);
 
     char* status_path = NULL;
@@ -510,21 +558,12 @@ static int jdebug_coredump_write_prstatus(coredump_state_t* state)
     if (!status_fp)
       goto done;
 
-    char* line    = NULL;
-    size_t line_n = 0;
-
     while (getline(&line, &line_n, status_fp) > 0) {
-      char* c;
-      if ((c = strstr(line, "PPid:"))) {
-        status.pr_ppid = (int) strtol(c, NULL, 10);
-      } else if ((c = strstr(line, "Tgid:"))) {
-        status.pr_pgrp = (int) strtol(c, NULL, 10);
-      }
+      if (0 == strncmp(line, "PPid:", 5))
+        status.pr_ppid = (int) strtol(line + 5, NULL, 10);
     }
 
     fclose(status_fp);
-    free(line);
-    line = NULL;
 
     if (asprintf(&status_path, "/proc/%d/task/%d/stat", state->process, task) < 0 || !status_path)
       goto done;
@@ -536,33 +575,38 @@ static int jdebug_coredump_write_prstatus(coredump_state_t* state)
     if (!status_fp)
       goto done;
 
-    if (getline(&line, &line_n, status_fp) > 0) {
+    const ssize_t stat_len = getline(&line, &line_n, status_fp);
+    fclose(status_fp);
+
+    // the comm field (2) may contain spaces and parentheses, start parsing after its last ')'
+    char* stat_fields = stat_len > 0 ? strrchr(line, ')') : NULL;
+    if (stat_fields) {
       char *sv, *field;
-      size_t field_i = 0;
-      int64_t ms;
-      for (field = strtok_r(line, " ", &sv);
+      size_t field_i = 3; // field numbers as in `man 5 proc`
+      int64_t us;
+      for (field = strtok_r(stat_fields + 1, " ", &sv);
            field;
-           ++field_i, field = strtok_r(NULL, "", &sv)) {
+           ++field_i, field = strtok_r(NULL, " ", &sv)) {
         switch (field_i) {
           case 14: // utime
-            ms                      = ms_per_sec * strtol(field, NULL, 10) / clock_tick_per_sec;
-            status.pr_utime.tv_sec  = ms / ms_per_sec;
-            status.pr_utime.tv_usec = ms % ms_per_sec;
+            us                      = us_per_sec * strtol(field, NULL, 10) / clock_tick_per_sec;
+            status.pr_utime.tv_sec  = us / us_per_sec;
+            status.pr_utime.tv_usec = us % us_per_sec;
             break;
           case 15: // stime
-            ms                      = ms_per_sec * strtol(field, NULL, 10) / clock_tick_per_sec;
-            status.pr_stime.tv_sec  = ms / ms_per_sec;
-            status.pr_stime.tv_usec = ms % ms_per_sec;
+            us                      = us_per_sec * strtol(field, NULL, 10) / clock_tick_per_sec;
+            status.pr_stime.tv_sec  = us / us_per_sec;
+            status.pr_stime.tv_usec = us % us_per_sec;
             break;
           case 16: // cutime
-            ms                       = ms_per_sec * strtol(field, NULL, 10) / clock_tick_per_sec;
-            status.pr_cutime.tv_sec  = ms / ms_per_sec;
-            status.pr_cutime.tv_usec = ms % ms_per_sec;
+            us                       = us_per_sec * strtol(field, NULL, 10) / clock_tick_per_sec;
+            status.pr_cutime.tv_sec  = us / us_per_sec;
+            status.pr_cutime.tv_usec = us % us_per_sec;
             break;
           case 17: // cstime
-            ms                       = ms_per_sec * strtol(field, NULL, 10) / clock_tick_per_sec;
-            status.pr_cstime.tv_sec  = ms / ms_per_sec;
-            status.pr_cstime.tv_usec = ms % ms_per_sec;
+            us                       = us_per_sec * strtol(field, NULL, 10) / clock_tick_per_sec;
+            status.pr_cstime.tv_sec  = us / us_per_sec;
+            status.pr_cstime.tv_usec = us % us_per_sec;
             break;
           case 31: // signal
             status.pr_sigpend = strtoul(field, NULL, 10);
@@ -594,11 +638,13 @@ static int jdebug_coredump_write_prstatus(coredump_state_t* state)
       regs.r8       = state->ucontext->uc_mcontext.gregs[REG_R8];
       regs.rax      = state->ucontext->uc_mcontext.gregs[REG_RAX];
       regs.rcx      = state->ucontext->uc_mcontext.gregs[REG_RCX];
+      regs.rdx      = state->ucontext->uc_mcontext.gregs[REG_RDX];
       regs.rsi      = state->ucontext->uc_mcontext.gregs[REG_RSI];
       regs.rdi      = state->ucontext->uc_mcontext.gregs[REG_RDI];
       regs.orig_rax = -1;
       regs.rip      = state->ucontext->uc_mcontext.gregs[REG_RIP];
       regs.rsp      = state->ucontext->uc_mcontext.gregs[REG_RSP];
+      regs.eflags   = state->ucontext->uc_mcontext.gregs[REG_EFL];
     }
     memcpy(&status.pr_reg, &regs, sizeof(status.pr_reg));
 
@@ -615,7 +661,17 @@ static int jdebug_coredump_write_prstatus(coredump_state_t* state)
       goto done;
 
     prfpregset_t fpregs;
-    if (-1 == ptrace(PTRACE_GETFPREGS, task, &fpregs, &fpregs))
+    int have_fpregs = 0;
+
+    // the crashing task is currently inside the signal handler,
+    //  its floating point state at the time of the crash was saved by the kernel in the signal frame
+    if (task == state->crash_task && state->ucontext->uc_mcontext.fpregs) {
+      const struct iovec local  = {&fpregs, sizeof(fpregs)};
+      const struct iovec remote = {state->ucontext->uc_mcontext.fpregs, sizeof(fpregs)};
+      have_fpregs               = process_vm_readv(state->process, &local, 1, &remote, 1, 0) == sizeof(fpregs);
+    }
+
+    if (!have_fpregs && -1 == ptrace(PTRACE_GETFPREGS, task, &fpregs, &fpregs))
       goto done;
 
     if (-1 == jdebug_coredump_do_write(state, &fpregs, sizeof(fpregs)))
@@ -625,6 +681,7 @@ static int jdebug_coredump_write_prstatus(coredump_state_t* state)
   ret = 0;
 
 done:
+  free(line);
   return ret;
 }
 
@@ -698,9 +755,7 @@ static int jdebug_coredump_seek(coredump_state_t* state, size_t pos)
       n = sizeof(buf);
 
     ssize_t wrote = jdebug_write_all(state->output_fd, buf, n);
-    if (-1 == wrote) {
-      if (errno == EINTR)
-        continue;
+    if (wrote <= 0) {
       ret = -1;
       break;
     }
@@ -713,7 +768,7 @@ static int jdebug_coredump_seek(coredump_state_t* state, size_t pos)
 static int jdebug_coredump_do_write(coredump_state_t* state, const void* buf, size_t len)
 {
   ssize_t wrote = jdebug_write_all(state->output_fd, buf, len);
-  if (-1 == wrote) {
+  if (wrote < 0) {
     return -1;
   }
   state->n_wrote += wrote;
@@ -754,7 +809,7 @@ static const char* jdebug_coredump_compressor_ext(compressor_t compressor)
   return NULL;
 }
 
-static compressor_t jdebug_coredump_choose_compressor()
+static compressor_t jdebug_coredump_choose_compressor(void)
 {
   compressor_t compressor = JDEBUG_COREDUMP_COMPRESSOR_ZSTD;
   do {
@@ -763,19 +818,27 @@ static compressor_t jdebug_coredump_choose_compressor()
       const char* prog   = jdebug_coredump_compressor_prog(compressor);
       const char* args[] = {prog, "-V", NULL};
 
-      int devnull = open("/dev/null", O_WRONLY);
-      dup2(devnull, STDOUT_FILENO);
-      close(devnull);
+      int devnull = open("/dev/null", O_RDWR);
+      if (-1 != devnull) {
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+      }
 
       execvp(prog, (char* const*) args);
-      _Exit(errno);
+      _Exit(127);
     }
     if (child < 0)
       continue;
     int wstatus = 0;
-    if (!waitpid(child, &wstatus, 0))
+    pid_t r;
+    while (-1 == (r = waitpid(child, &wstatus, 0)) && errno == EINTR) {
+      /* no-op */
+    }
+    if (-1 == r)
       continue;
-    if (!WEXITSTATUS(wstatus))
+    if (WIFEXITED(wstatus) && 0 == WEXITSTATUS(wstatus))
       return compressor;
   } while (++compressor <= JDEBUG_COREDUMP_COMPRESSOR_LAST);
   return JDEBUG_COREDUMP_COMPRESSOR_NONE;
@@ -830,18 +893,20 @@ static int jdebug_coredump_open_compressor(coredump_state_t* state)
 
 static int jdebug_coredump_close_compressor(coredump_state_t* state)
 {
-  if (state->output_fd > 0)
+  if (state->output_fd >= 0) {
     close(state->output_fd);
+    state->output_fd = -1;
+  }
 
   if (state->compressor_pid <= 0)
-    return -1;
+    return 0; // no compressor
 
   int wstatus = 0;
   int r;
   do {
     r = waitpid(state->compressor_pid, &wstatus, 0);
-  } while (-1 == r && errno != EINTR);
+  } while (-1 == r && errno == EINTR);
   if (-1 == r)
     return -1;
-  return WEXITSTATUS(wstatus) == 0 ? 0 : -1;
+  return WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0 ? 0 : -1;
 }

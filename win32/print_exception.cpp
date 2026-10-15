@@ -31,12 +31,12 @@ static void jdebug_print_vcruntime_exception(const logger_t* log, ULONG_PTR* exc
     const size_t p3               = ((DWORD*) p2)[3];
     const size_t p4               = ((DWORD*) (b + p3))[1];
     const DWORD p5                = ((DWORD*) (b + p4))[1];
-    const char* mangled_type_name = (char*) (b + p5) + sizeof(void*) * 2;
+    const char* mangled_type_name = (char*) (b + p5) + sizeof(void*) * 2 + 1;
 
-    char name_buf[1024];
+    char name_buf[4096];
     ZeroMemory(name_buf, sizeof(name_buf));
-    UnDecorateSymbolName(mangled_type_name + 1, name_buf, sizeof(name_buf), 0x2800);
-    jdebug_log_printf(log, " '%s'", name_buf);
+    const DWORD ok = UnDecorateSymbolName(mangled_type_name, name_buf, sizeof(name_buf), 0x2800);
+    jdebug_log_printf(log, " '%s'", ok ? name_buf : mangled_type_name);
   }
 }
 

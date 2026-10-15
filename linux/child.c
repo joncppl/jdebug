@@ -70,7 +70,7 @@ int jdebug_run(crash_state_t* state)
   if (-1 == jdebug_enumerate_tasks(state->crash_pid, &state->tasks)) {
     const int lerrno = errno;
     jdebug_log_format(&state->log, "error occurred handling crash\n");
-    jdebug_log_format(&state->log, "failed to poll stdin: %s\n", strerror(lerrno));
+    jdebug_log_format(&state->log, "failed to enumerate tasks: %s\n", strerror(lerrno));
     return 1;
   }
 

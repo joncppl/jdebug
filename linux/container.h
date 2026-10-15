@@ -204,7 +204,7 @@ jcontainer_array_remove_generic(
 
   jcontainer_memmove((char*) array->base + element_size * pos,
                      (char*) array->base + element_size * (pos + 1),
-                     element_size * (array->size - pos));
+                     element_size * (array->size - pos - 1));
   --array->size;
 
   return 0;

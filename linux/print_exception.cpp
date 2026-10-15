@@ -61,8 +61,10 @@ DemangledSymbol current_exception_type_name()
 extern "C" void jdebug_print_cpp_exception(const logger_t* log)
 {
   const std::exception_ptr exception = std::current_exception();
-  if (!exception)
+  if (!exception) {
+    jdebug_log_format(log, "abort called\n");
     return;
+  }
 
   try {
     std::rethrow_exception(exception);
@@ -71,7 +73,7 @@ extern "C" void jdebug_print_cpp_exception(const logger_t* log)
                       current_exception_type_name().get("unknown type"),
                       e.what());
   } catch (...) {
-    jdebug_log_format(log, "Uncaught C++ exception: '%s'",
+    jdebug_log_format(log, "Uncaught C++ exception: '%s'\n",
                       current_exception_type_name().get("unknown type"));
   }
 }

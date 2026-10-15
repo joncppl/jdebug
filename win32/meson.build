@@ -1,13 +1,18 @@
 sources = ['jdebug.c', 'log.c', 'symbol.c']
-c_args = ['-experimental:c11atomics']
+c_args = []
 
 compiler = meson.get_compiler('c')
+
+if compiler.get_id() == 'msvc'
+    c_args += '/experimental:c11atomics'
+endif
+
 deps = [
     compiler.find_library('psapi'),
     compiler.find_library('dbghelp'),
 ]
 
-if get_option('examples').enabled()
+if get_option('cxx_exceptions').enabled()
     sources += 'print_exception.cpp'
     c_args += '-DJDEBUG_PRINT_EXCEPTION=1'
 endif
@@ -18,7 +23,7 @@ if compiler.get_id() == 'gcc'
 endif
 
 
-jdebug_lib = library(
+jdebug_lib = static_library(
     'jdebug',
     sources,
     include_directories : include_directories('../include'),

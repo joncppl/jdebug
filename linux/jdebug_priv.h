@@ -12,9 +12,9 @@ int jdebug_run_child(pid_t crash_pid,
                      const char* coredump_file,
                      const char* log_file);
 
-void jdebug_install_signal_handlers();
+void jdebug_install_signal_handlers(void);
 
-void jdebug_uninstall_signal_handlers();
+void jdebug_uninstall_signal_handlers(void);
 
 void jdebug_print_signal_info(const logger_t* log,
                               const siginfo_t* info,
@@ -44,6 +44,7 @@ typedef struct mapping
   char* pathname;
 
   size_t load_bias;
+  int has_load_bias;
 
   JCONTAINER_LL_FIELD_TYPED(struct mapping)
 } mapping_t;
@@ -77,7 +78,7 @@ stack_frame_list_t* jdebug_read_stack_trace(int fd);
 void jdebug_free_stacktrace(stack_frame_list_t* trace);
 void jdebug_print_stack_trace(const logger_t* log, stack_frame_list_t* trace, mapping_t* mappings);
 
-long jdebug_gettime_monotonic_ms();
+long jdebug_gettime_monotonic_ms(void);
 ssize_t jdebug_read_all(int fd, void* buf, size_t size, long timeout_ms);
 ssize_t jdebug_write_all(int fd, const void* buf, size_t size);
 char* jdebug_demangle(const char* mangled);

@@ -3,6 +3,7 @@
 #include "syscall.h"
 
 #include <dlfcn.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -12,7 +13,9 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 
-long jdebug_gettime_monotonic_ms()
+extern char** environ;
+
+long jdebug_gettime_monotonic_ms(void)
 {
   struct timespec time;
   if (clock_gettime(CLOCK_MONOTONIC, &time)) {
@@ -60,6 +63,7 @@ ssize_t jdebug_read_all(int fd, void* buf, size_t size, long timeout_ms)
         if (r > 0) {
           if (-1 == ioctl(fd, FIONREAD, &available) || available < 0) {
             close(epoll);
+            return -1;
           }
         }
 
@@ -134,16 +138,17 @@ static int jdebug_demangled_exec(demangle_exec_data_t* data)
   SYSCALL(SYS_close, data->pipe);
 
   char self_buf[FILENAME_MAX] = {0};
-  if (SYSCALL(SYS_readlink, "/proc/self/exe", self_buf, sizeof(self_buf)) < 0)
+  if (SYSCALL(SYS_readlink, "/proc/self/exe", self_buf, sizeof(self_buf) - 1) < 0)
     _Exit(EXIT_FAILURE);
 
   const char* args[] = {
     self_buf,
     JDEBUG_DEMANGLE_ARG,
     data->mangled_symbol,
+    NULL,
   };
 
-  SYSCALL(SYS_execve, self_buf, args, 0);
+  SYSCALL(SYS_execve, self_buf, args, environ);
   return EXIT_FAILURE;
 }
 
@@ -187,11 +192,15 @@ char* jdebug_demangle_safe(const char* mangled_symbol)
 
   do {
     siginfo_t info;
-    err = SYSCALL(SYS_waitid, P_PID, child, &info, WEXITED);
-    if (err < 0 && -err != EINTR)
-      break;
+    memset(&info, 0, sizeof(info));
+    err = SYSCALL(SYS_waitid, P_PID, child, &info, WEXITED, NULL);
+    if (err < 0) {
+      if (-err != EINTR)
+        break;
+      continue;
+    }
 
-    exit_code = info.si_status;
+    exit_code = info.si_code == CLD_EXITED ? info.si_status : 1;
   } while (err < 0);
 
   if (exit_code)
@@ -207,16 +216,19 @@ char* jdebug_demangle_safe(const char* mangled_symbol)
     goto done;
 
   result = (char*) err;
-  err    = SYSCALL(SYS_read, pipe[0], result, demangled_len);
+  err    = jdebug_read_all(pipe[0], result, demangled_len, 0);
   if (err < 0) {
+    SYSCALL(SYS_munmap, result, demangled_len + 1);
+    result = NULL;
     goto done;
   }
+
   result[err] = 0;
 
 done:
-  if (pipe[0])
+  if (pipe[0] >= 0)
     SYSCALL(SYS_close, pipe[0]);
-  if (pipe[1])
+  if (pipe[1] >= 0)
     SYSCALL(SYS_close, pipe[1]);
 
   if (stack_base)

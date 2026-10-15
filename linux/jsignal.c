@@ -1,21 +1,35 @@
 #include "jdebug_priv.h"
 
+#include "syscall.h"
+
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ucontext.h>
 
-struct sigaction g_sigaction_abrt;
-struct sigaction g_sigaction_bus;
-struct sigaction g_sigaction_fpe;
-struct sigaction g_sigaction_ill;
-struct sigaction g_sigaction_segv;
-struct sigaction g_sigaction_sys;
+static struct sigaction g_sigaction_abrt;
+static struct sigaction g_sigaction_bus;
+static struct sigaction g_sigaction_fpe;
+static struct sigaction g_sigaction_ill;
+static struct sigaction g_sigaction_segv;
+static struct sigaction g_sigaction_sys;
+
+static atomic_flag g_handling_crash = ATOMIC_FLAG_INIT;
 
 void jdebug_crash_handler(siginfo_t* info, void* ucontext);
 
 static void jdebug_handler(int signum, siginfo_t* info, void* ucontext)
 {
+  // Only one thread may handle a crash at a time.
+  // Any other thread crashing concurrently waits here until the process is terminated.
+  // (A crash on the same thread while handling cannot reach this point,
+  //  since all handled signals are blocked during the handler, see `sa_mask`.)
+  if (atomic_flag_test_and_set(&g_handling_crash)) {
+    for (;;)
+      SYSCALL(SYS_pause);
+  }
+
   signal(signum, SIG_DFL);
 
   jdebug_crash_handler(info, ucontext);
@@ -48,15 +62,24 @@ static void jdebug_handler(int signum, siginfo_t* info, void* ucontext)
     sigaction(signum, restore_handler, NULL);
   }
 
+  atomic_flag_clear(&g_handling_crash);
+
   raise(signum);
 }
 
-void jdebug_install_signal_handlers()
+void jdebug_install_signal_handlers(void)
 {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_flags     = SA_SIGINFO;
   sa.sa_sigaction = jdebug_handler;
+  sigemptyset(&sa.sa_mask);
+  sigaddset(&sa.sa_mask, SIGABRT);
+  sigaddset(&sa.sa_mask, SIGBUS);
+  sigaddset(&sa.sa_mask, SIGFPE);
+  sigaddset(&sa.sa_mask, SIGILL);
+  sigaddset(&sa.sa_mask, SIGSEGV);
+  sigaddset(&sa.sa_mask, SIGSYS);
   sigaction(SIGABRT, &sa, &g_sigaction_abrt);
   sigaction(SIGBUS, &sa, &g_sigaction_bus);
   sigaction(SIGFPE, &sa, &g_sigaction_fpe);
@@ -65,7 +88,7 @@ void jdebug_install_signal_handlers()
   sigaction(SIGSYS, &sa, &g_sigaction_sys);
 }
 
-void jdebug_uninstall_signal_handlers()
+void jdebug_uninstall_signal_handlers(void)
 {
   sigaction(SIGABRT, &g_sigaction_abrt, NULL);
   sigaction(SIGBUS, &g_sigaction_bus, NULL);
@@ -98,7 +121,7 @@ static void print_sigbus(const logger_t* log, const siginfo_t* info)
       jdebug_log_format(log, "reason: unspecified. ");
       break;
   }
-  jdebug_log_format(log, "fault address: %p\n", info->si_addr);
+  jdebug_log_format(log, "fault address: 0x%p\n", info->si_addr);
 }
 
 static void print_sigfpe(const logger_t* log, const siginfo_t* info)
@@ -132,7 +155,7 @@ static void print_sigfpe(const logger_t* log, const siginfo_t* info)
       jdebug_log_format(log, "reason: unspecified. ");
       break;
   }
-  jdebug_log_format(log, "fault address: %p\n", info->si_addr);
+  jdebug_log_format(log, "fault address: 0x%p\n", info->si_addr);
 }
 
 static void print_sigill(const logger_t* log, const siginfo_t* info)
@@ -188,7 +211,7 @@ static void print_sigsegv(const logger_t* log, const siginfo_t* info)
       jdebug_log_format(log, "reason: unspecified. ");
       break;
   }
-  jdebug_log_format(log, "fault address: %p\n", info->si_addr);
+  jdebug_log_format(log, "fault address: 0x%p\n", info->si_addr);
 }
 
 static void print_ucontext(const logger_t* log, const ucontext_t* ctx)
@@ -249,10 +272,31 @@ static void print_ucontext(const logger_t* log, const ucontext_t* ctx)
 
 void jdebug_print_cpp_exception(const logger_t* log);
 
+// `strsignal` is not async-signal-safe
+static const char* jdebug_signal_name(int signo)
+{
+  switch (signo) {
+    case SIGABRT:
+      return "Aborted";
+    case SIGBUS:
+      return "Bus error";
+    case SIGFPE:
+      return "Floating point exception";
+    case SIGILL:
+      return "Illegal instruction";
+    case SIGSEGV:
+      return "Segmentation fault";
+    case SIGSYS:
+      return "Bad system call";
+    default:
+      return "Unknown signal";
+  }
+}
+
 void jdebug_print_signal_info(const logger_t* log, const siginfo_t* info, const void* ucontext)
 {
   jdebug_log_format(log, "fatal signal occurred: %s (%d)\n",
-                    strsignal(info->si_signo),
+                    jdebug_signal_name(info->si_signo),
                     info->si_signo);
 
   switch (info->si_signo) {
@@ -264,7 +308,7 @@ void jdebug_print_signal_info(const logger_t* log, const siginfo_t* info, const 
 #ifdef JDEBUG_PRINT_EXCEPTION
       jdebug_print_cpp_exception(log);
 #else
-      jdebug_log_format(log, "Uncaught C++ exception\n");
+      jdebug_log_format(log, "abort called (possibly due to an uncaught C++ exception)\n");
 #endif
       break;
     case SIGBUS:

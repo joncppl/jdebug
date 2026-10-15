@@ -42,7 +42,7 @@ Supported Environments:
 
 ```bash
 cd jdebug
-cmake -B build -DCMAKE_BUILD_TYPE=DebWithRelInfo -DJDEBUG_ENABLE_EXAMPLES=ON
+cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DJDEBUG_ENABLE_EXAMPLES=ON
 cmake --build build
 
 # run examples
@@ -56,6 +56,9 @@ cmake --build build
 cd jdebug
 meson setup build --buildtype debugoptimized -Dexamples=enabled
 meson compile -C build
+
+# the c++ exception printer may be disabled with -Dcxx_exceptions=disabled
+# (CMake: -DJDEBUG_ENABLE_CXX_EXCEPTION_PRINTER=OFF)
 
 # run examples
 ./build/example/example_c --help
@@ -118,7 +121,7 @@ int main(int argc, char* argv[])
 
   // configure output files and init
   // `log_filename` and `coredump_filename` may be NULL if logging/coredump is not needed.
-  jdebug_crash_handler_init_info_t init_info {
+  jdebug_crash_handler_init_info_t init_info = {
     .log_filename      = "myfile.log",
     .coredump_filename = "mydump.core",
   };
@@ -154,10 +157,9 @@ int main(int argc, char* argv[])
   std::filesystem::path coredump_filename = "mydump.core";
 
   // configure output files and init
-  jdebug::ScopedCrashHandlerInitInfo init_info {
-    .log_filename = std::move(log_file),
-    .coredump_filename = std::move(coredump_filename),
-  };
+  jdebug::ScopedCrashHandlerInitInfo init_info;
+  init_info.log_filename      = std::move(log_filename);
+  init_info.coredump_filename = std::move(coredump_filename);
 
   jdebug::ScopedCrashHandler crash_handler(init_info);
 
@@ -177,6 +179,10 @@ int main(int argc, char* argv[])
 
 To support paths containing extended characters on Windows, wide characters are used for paths.
 As such you will need to implement `wmain` rather than `main` and provide `wchar_t*` paths to init.
+(With MinGW, link with `-municode` to use `wmain`.)
+
+On Windows, if no `log_filename` is given, the log is written to a temporary file (`%TEMP%\stack*.tmp`) when a crash occurs,
+and its path is printed to stderr.
 
 ```c
 int wmain(int argc, wchar_t* argv[])

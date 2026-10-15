@@ -18,6 +18,8 @@
 #include <unistd.h>
 
 
+extern char** environ;
+
 static char g_log_filename[FILENAME_MAX]  = {0};
 static char g_core_filename[FILENAME_MAX] = {0};
 static _Atomic int g_init_count           = 0;
@@ -41,17 +43,24 @@ void jdebug_crash_handler_early(int argc, char* argv[])
 
 static int jdebug_make_path_absolute(const char* path, char* out)
 {
+  int written;
+
   if (path[0] == '/') {
-    strncpy(out, path, FILENAME_MAX);
-    return 0;
+    written = snprintf(out, FILENAME_MAX, "%s", path);
+  } else {
+    char cwd[FILENAME_MAX] = {0};
+    if (!getcwd(cwd, FILENAME_MAX)) {
+      out[0] = '\0';
+      return -1;
+    }
+    written = snprintf(out, FILENAME_MAX, "%s/%s", cwd, path);
   }
 
-  char cwd[FILENAME_MAX] = {0};
-  if (!getcwd(cwd, FILENAME_MAX))
+  // reject (rather than silently truncate) paths that do not fit
+  if (written < 0 || written >= FILENAME_MAX) {
+    out[0] = '\0';
     return -1;
-
-  if (snprintf(out, FILENAME_MAX, "%s/%s", cwd, path) < (int) (strlen(cwd) + strlen(path) + 1))
-    return -1;
+  }
 
   return 0;
 }
@@ -59,6 +68,12 @@ static int jdebug_make_path_absolute(const char* path, char* out)
 void jdebug_crash_handler_init(jdebug_crash_handler_init_info_t* init_info)
 {
   if (atomic_fetch_add(&g_init_count, 1) == 0) {
+    jdebug_crash_handler_init_info_t init_info_default;
+    if (NULL == init_info) {
+      jdebug_crash_handler_init_info_reset(&init_info_default);
+      init_info = &init_info_default;
+    }
+
     if (NULL != init_info->log_filename) {
       jdebug_make_path_absolute(init_info->log_filename, g_log_filename);
     } else {
@@ -80,9 +95,15 @@ void jdebug_crash_handler_init(jdebug_crash_handler_init_info_t* init_info)
   }
 }
 
-void jdebug_crash_handler_deinit()
+void jdebug_crash_handler_deinit(void)
 {
-  if (atomic_fetch_sub(&g_init_count, 1) == 1) {
+  int count = atomic_load(&g_init_count);
+  do {
+    if (count <= 0)
+      return;
+  } while (!atomic_compare_exchange_weak(&g_init_count, &count, count - 1));
+
+  if (count == 1) {
     jdebug_uninstall_signal_handlers();
     memset(g_log_filename, 0, sizeof(g_log_filename));
     memset(g_core_filename, 0, sizeof(g_core_filename));
@@ -117,6 +138,10 @@ void jdebug_crash_handler(siginfo_t* info, void* ucontext)
 
   long err;
 
+  struct exec_data data;
+  data.stdin_fds[0] = -1;
+  data.stdin_fds[1] = -1;
+
   const int dumpable_status = SYSCALL(SYS_prctl, PR_GET_DUMPABLE);
   if (1 != dumpable_status) {
     if ((err = SYSCALL(SYS_prctl, PR_SET_DUMPABLE, 1)) < 0) {
@@ -126,14 +151,13 @@ void jdebug_crash_handler(siginfo_t* info, void* ucontext)
     }
   }
 
-  struct exec_data data;
   data.crash_pid         = SYSCALL(SYS_getpid);
   data.crash_tid         = SYSCALL(SYS_gettid);
   data.log_filename      = g_log_filename[0] ? g_log_filename : NULL;
   data.coredump_filename = g_core_filename[0] ? g_core_filename : NULL;
 
   char self_buf[FILENAME_MAX] = {0};
-  if ((err = SYSCALL(SYS_readlink, "/proc/self/exe", self_buf, sizeof(self_buf))) < 0) {
+  if ((err = SYSCALL(SYS_readlink, "/proc/self/exe", self_buf, sizeof(self_buf) - 1)) < 0) {
     jdebug_log_format(&log, "error occurred handling crash\n");
     jdebug_log_format(&log, "failed to read /proc/self/exe: %ld\n", -err);
     goto done;
@@ -141,7 +165,13 @@ void jdebug_crash_handler(siginfo_t* info, void* ucontext)
   self_buf[err]   = '\0';
   data.executable = self_buf;
 
-  SYSCALL(SYS_pipe, data.stdin_fds);
+  if ((err = SYSCALL(SYS_pipe, data.stdin_fds)) < 0) {
+    data.stdin_fds[0] = -1;
+    data.stdin_fds[1] = -1;
+    jdebug_log_format(&log, "error occurred handling crash\n");
+    jdebug_log_format(&log, "failed to create pipe: %ld\n", -err);
+    goto done;
+  }
 
   err = SYSCALL(SYS_mmap, NULL, g_stack_size, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
@@ -166,6 +196,7 @@ void jdebug_crash_handler(siginfo_t* info, void* ucontext)
   child_pid = err;
 
   SYSCALL(SYS_close, data.stdin_fds[0]);
+  data.stdin_fds[0]  = -1;
   const int stdin_fd = data.stdin_fds[1];
 
   // We know the child will block on reading the pipe.
@@ -198,15 +229,21 @@ void jdebug_crash_handler(siginfo_t* info, void* ucontext)
     goto done;
   }
 
+  SYSCALL(SYS_close, data.stdin_fds[1]);
+  data.stdin_fds[1] = -1;
+
   do {
-    siginfo_t info;
-    err = SYSCALL(SYS_waitid, P_PID, child_pid, &info, WEXITED);
-    if (err < 0 && -err != EINTR) {
-      break;
+    siginfo_t child_info;
+    memset(&child_info, 0, sizeof(child_info));
+    err = SYSCALL(SYS_waitid, P_PID, child_pid, &child_info, WEXITED, NULL);
+    if (err < 0) {
+      if (-err != EINTR)
+        break;
+      continue;
     }
-    child_exited = info.si_code == CLD_EXITED
-                   || info.si_code == CLD_KILLED
-                   || info.si_code == CLD_DUMPED;
+    child_exited = child_info.si_code == CLD_EXITED
+                   || child_info.si_code == CLD_KILLED
+                   || child_info.si_code == CLD_DUMPED;
   } while (err < 0);
 
   if (err < 0) {
@@ -215,8 +252,17 @@ void jdebug_crash_handler(siginfo_t* info, void* ucontext)
   }
 
 done:
-  if (child_pid > 0 && !child_exited)
+  if (data.stdin_fds[0] >= 0)
+    SYSCALL(SYS_close, data.stdin_fds[0]);
+  if (data.stdin_fds[1] >= 0)
+    SYSCALL(SYS_close, data.stdin_fds[1]);
+
+  if (child_pid > 0 && !child_exited) {
     SYSCALL(SYS_kill, child_pid, SIGKILL);
+    // reap the child so it is not left as a zombie
+    siginfo_t child_info;
+    SYSCALL(SYS_waitid, P_PID, child_pid, &child_info, WEXITED, NULL);
+  }
 
   if (stack_base)
     SYSCALL(SYS_munmap, stack_base, g_stack_size);
@@ -247,7 +293,7 @@ static int jdebug_exec_dump_child(struct exec_data* data)
     NULL,
   };
 
-  long err = SYSCALL(SYS_execve, data->executable, args, 0);
+  long err = SYSCALL(SYS_execve, data->executable, args, environ);
 
   logger_t log;
   jdebug_log_init(&log, data->log_filename);

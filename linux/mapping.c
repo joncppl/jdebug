@@ -18,6 +18,7 @@ mapping_t* jdebug_mappings_load(pid_t pid)
   mapping_t* mappings = NULL;
   char* map_path      = NULL;
   char* line          = NULL;
+  FILE* map_file      = NULL;
   size_t line_n       = 0;
 
   if (-1 == asprintf(&map_path, "/proc/%d/maps", pid)) {
@@ -25,16 +26,15 @@ mapping_t* jdebug_mappings_load(pid_t pid)
     goto error;
   }
 
-  FILE* map_file = fopen(map_path, "r");
+  map_file = fopen(map_path, "r");
   if (!map_file)
     goto error;
 
   while (getline(&line, &line_n, map_file) > 0) {
-    mapping_t mapping = {0};
-    char* cursor      = line;
-    char* end         = NULL;
-    char access_buf[5];
-    size_t l;
+    mapping_t mapping  = {0};
+    char* cursor       = line;
+    char* end          = NULL;
+    char access_buf[5] = {0};
 
     mapping.s_addr = strtoull(cursor, &end, 16);
     if (end == cursor || *end != '-')
@@ -46,11 +46,11 @@ mapping_t* jdebug_mappings_load(pid_t pid)
       continue;
     cursor = end + 1;
 
-    l = strlen(line);
-    if (l < 4)
+    if (strlen(cursor) < 4)
       continue;
 
-    strncpy(access_buf, cursor, 4);
+    memcpy(access_buf, cursor, 4);
+    access_buf[4] = '\0';
     cursor += 4;
 
     mapping.offset = strtoull(cursor, &end, 16);
@@ -108,24 +108,30 @@ mapping_t* jdebug_mappings_load(pid_t pid)
     if (strchr(access_buf, 'p'))
       mapping.access |= MAPPING_ACCESS_PRIV;
 
-    if (mapping.pathname && pathname_len > 1) {
+    if (mapping.pathname && mapping.pathname[0] == '/') {
       if (jdebug_get_load_bias(&mapping)) {
-        mapping.load_bias = 0;
+        mapping.load_bias     = 0;
+        mapping.has_load_bias = 0;
       }
     }
 
-    if (jcontainer_ll_push_back(&mappings, &mapping))
+    if (jcontainer_ll_push_back(&mappings, &mapping)) {
+      free(mapping.pathname);
       goto error;
+    }
   }
 
   goto done;
 
 error:
   jdebug_mappings_free(mappings);
+  mappings = NULL;
 
 done:
   free(line);
-  free(map_file);
+  free(map_path);
+  if (map_file)
+    fclose(map_file);
   return mappings;
 }
 
@@ -161,6 +167,12 @@ static int jdebug_get_load_bias(mapping_t* mapping)
   if (jdebug_read_all(fd, &elf_header, sizeof(elf_header), JDEBUG_DEFAULT_TIMEOUT_MS) != sizeof(elf_header))
     goto done;
 
+  // the mapped file is not necessarily an ELF object
+  if (0 != memcmp(elf_header.e_ident, ELFMAG, SELFMAG)
+      || elf_header.e_ident[EI_CLASS] != ELFCLASS64
+      || elf_header.e_phentsize != sizeof(Elf64_Phdr))
+    goto done;
+
 
   for (Elf64_Half i = 0; i < elf_header.e_phnum; ++i) {
     Elf64_Phdr phdr = {0};
@@ -183,9 +195,17 @@ static int jdebug_get_load_bias(mapping_t* mapping)
   for (size_t i = 0; i < phdr_list.size; ++i) {
     Elf64_Phdr* phdr = &phdr_list.base[i];
 
-    if (phdr->p_offset >= mapping->offset) {
-      mapping->load_bias = mapping->s_addr - jdebug_round_down_power_of_2(phdr->p_vaddr, page_size);
-      ret                = 0;
+    // find the segment which contains the mapping's file offset
+    // (a segment may be split into multiple mappings, eg. by RELRO)
+    const size_t seg_start = jdebug_round_down_power_of_2((size_t) phdr->p_offset, (size_t) page_size);
+    const size_t seg_end   = jdebug_round_up_power_of_2((size_t) (phdr->p_offset + phdr->p_filesz), (size_t) page_size);
+
+    if (seg_start <= mapping->offset && mapping->offset < seg_end) {
+      // virtual address (in the object) of the start of the mapping
+      const size_t object_addr = phdr->p_vaddr - phdr->p_offset + mapping->offset;
+      mapping->load_bias       = mapping->s_addr - object_addr;
+      mapping->has_load_bias   = 1;
+      ret                      = 0;
       break;
     }
   }
@@ -213,7 +233,7 @@ size_t jdebug_mapping_size(const mapping_t* mapping)
 
 size_t jdebug_mapping_memory_to_object(const mapping_t* mapping, const size_t memory_addr)
 {
-  if (mapping->load_bias > 0)
+  if (mapping->has_load_bias)
     return memory_addr - mapping->load_bias;
   else
     return memory_addr - mapping->s_addr + mapping->offset;
@@ -223,7 +243,7 @@ const mapping_t* jdebug_mapping_lookup(const mapping_t* mappings, const size_t a
 {
   jcontainer_ll_foreach(&mappings, mapping)
   {
-    if (addr >= mapping->s_addr && addr <= mapping->e_addr)
+    if (addr >= mapping->s_addr && addr < mapping->e_addr)
       return mapping;
   }
 
@@ -264,13 +284,8 @@ static int jdebug_mapping_get_source_lines_die(const Dwarf_Debug dbg,
     if (dwarf_lineaddr(lines[i], &row_addr, &err))
       continue;
 
-    dwarf_lineendsequence(lines[i], &end_sequence, &err);
-    if (end_sequence)
+    if (dwarf_lineendsequence(lines[i], &end_sequence, &err) || end_sequence)
       continue;
-
-    if (dwarf_linesrc(lines[i], &src, &err)
-        || dwarf_lineno(lines[i], &lineno, &err))
-      goto done;
 
     if (row_addr <= target_addr && (!best || row_addr > best_addr)) {
       best      = lines[i];
@@ -290,14 +305,15 @@ static int jdebug_mapping_get_source_lines_die(const Dwarf_Debug dbg,
     goto done;
 
   *source_line = lineno;
-  ret          = 1;
+  ret          = 0;
 
 done:
   if (err)
     dwarf_dealloc_error(dbg, err);
   if (src)
     dwarf_dealloc(dbg, src, DW_DLA_STRING);
-  dwarf_srclines_dealloc_b(ctx);
+  if (ctx)
+    dwarf_srclines_dealloc_b(ctx);
   return ret;
 }
 
@@ -402,7 +418,7 @@ done:
   if (attr)
     dwarf_dealloc_attribute(attr);
   if (ranges)
-    dwarf_dealloc(dbg, ranges, DW_DLA_RANGES);
+    dwarf_dealloc_ranges(dbg, ranges, range_count);
   return ret;
 }
 
@@ -511,8 +527,13 @@ int jdebug_mapping_get_source_file(const mapping_t* mapping, size_t target_addr,
                                  NULL,
                                  &err)) {
     Dwarf_Die die = NULL;
-    if (dwarf_siblingof_b(dbg, NULL, 1, &die, &err))
+    if (dwarf_siblingof_b(dbg, NULL, 1, &die, &err)) {
+      if (err) {
+        dwarf_dealloc_error(dbg, err);
+        err = NULL;
+      }
       continue;
+    }
 
     if (!jdebug_mapping_dwarf_die_in_range(dbg, die, target_addr)) {
       dwarf_dealloc_die(die);

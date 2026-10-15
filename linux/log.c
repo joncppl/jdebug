@@ -22,8 +22,9 @@ int jdebug_log_init(logger_t* log, const char* filename)
     return 0;
   }
 
-  log->fd = SYSCALL(SYS_open, filename, O_CREAT | O_APPEND | O_WRONLY, 0644);
+  log->fd = SYSCALL(SYS_open, filename, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, 0644);
   if (log->fd < 0) {
+    log->fd = -1;
     memset(log->log_filename, 0, sizeof(log->log_filename));
     return -1;
   }
@@ -44,7 +45,7 @@ void jdebug_log_deinit(logger_t* log)
 static char* jdebug_printf_callback(const char* buf, void* user, int len)
 {
   const logger_t* logger = user;
-  if (logger->fd > 0)
+  if (logger->fd >= 0)
     SYSCALL(SYS_write, logger->fd, buf, len);
   SYSCALL(SYS_write, STDERR_FILENO, buf, len);
   return (char*) buf;

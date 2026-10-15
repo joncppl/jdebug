@@ -140,21 +140,22 @@
 #define SYSCLONE(fn, child_stack, flags, arg, parent_tidptr, newtls, child_tidptr) \
   __extension__({                                                                  \
     long __r;                                                                      \
+    void* __stack                       = (void*) (child_stack);                   \
     register void* __tls __asm__("r8")  = newtls;                                  \
     register int* __ctid __asm__("r10") = child_tidptr;                            \
     asm volatile(                                                                  \
-      "testq  %4,%4\n"                                                             \
+      "testq  %[clone_fn],%[clone_fn]\n"                                           \
       "jz     1f\n"                                                                \
                                                                                    \
-      "testq  %5,%5\n"                                                             \
+      "testq  %[clone_stack],%[clone_stack]\n"                                     \
       "jz     1f\n"                                                                \
                                                                                    \
-      "subq   $16,%5\n"                                                            \
+      "subq   $16,%[clone_stack]\n"                                                \
                                                                                    \
-      "movq   %7,8(%5)\n"                                                          \
-      "movq   %4,0(%5)\n"                                                          \
+      "movq   %[clone_arg],8(%[clone_stack])\n"                                    \
+      "movq   %[clone_fn],0(%[clone_stack])\n"                                     \
                                                                                    \
-      "movq   %2,%%rax\n"                                                          \
+      "movq   %[nr_clone],%%rax\n"                                                 \
       "syscall\n"                                                                  \
                                                                                    \
       "testq  %%rax,%%rax\n"                                                       \
@@ -167,13 +168,13 @@
       "call   *%%rax\n"                                                            \
                                                                                    \
       "movq   %%rax,%%rdi\n"                                                       \
-      "movq   %3,%%rax\n"                                                          \
+      "movq   %[nr_exit],%%rax\n"                                                  \
       "syscall\n"                                                                  \
                                                                                    \
       "1:\n"                                                                       \
-      : "=a"(__r)                                                                  \
-      : "0"(-EINVAL), "i"(__NR_clone), "i"(__NR_exit),                             \
-        "r"(fn), "S"(child_stack), "D"(flags), "r"(arg),                           \
+      : "=a"(__r), [clone_stack] "+S"(__stack)                                     \
+      : "0"(-EINVAL), [nr_clone] "i"(__NR_clone), [nr_exit] "i"(__NR_exit),        \
+        [clone_fn] "r"(fn), "D"((unsigned long) (flags)), [clone_arg] "r"(arg),    \
         "d"(parent_tidptr), "r"(__tls), "r"(__ctid)                                \
       : "memory", "r11", "rcx");                                                   \
     __r;                                                                           \

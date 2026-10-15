@@ -60,15 +60,13 @@ stack_frame_list_t* jdebug_read_stack_trace(int fd)
   for (size_t i = 0; i < max_stack_trace; ++i) {
     stack_frame_list_t frame;
 
-    if (jdebug_read_all(fd, &frame.frame, sizeof(stack_frame_t), JDEBUG_DEFAULT_TIMEOUT_MS) < 0) {
-      return NULL;
-    }
+    if (jdebug_read_all(fd, &frame.frame, sizeof(stack_frame_t), JDEBUG_DEFAULT_TIMEOUT_MS) < 0)
+      goto error;
 
     if (!frame.frame.ip)
       break;
 
-    frame.name = malloc(frame.frame.name_len + 1);
-    memset(frame.name, 0, frame.frame.name_len + 1);
+    frame.name = calloc(frame.frame.name_len + 1, 1);
     if (!frame.name)
       goto error;
 
@@ -79,8 +77,10 @@ stack_frame_list_t* jdebug_read_stack_trace(int fd)
 
     frame.name[frame.frame.name_len] = '\0';
 
-    if (jcontainer_ll_push_back(&trace, &frame))
+    if (jcontainer_ll_push_back(&trace, &frame)) {
+      free(frame.name);
       goto error;
+    }
   }
 
   return trace;

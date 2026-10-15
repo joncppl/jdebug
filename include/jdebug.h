@@ -28,17 +28,21 @@ extern "C"
 
   void jdebug_crash_handler_early(int argc, path_char_t* argv[]);
   void jdebug_crash_handler_init(jdebug_crash_handler_init_info_t* init_info);
-  void jdebug_crash_handler_deinit();
+  void jdebug_crash_handler_deinit(void);
 
 #ifdef __cplusplus
-};
+}
 
-#include <functional>
 #include <string>
-#include <thread>
-#include <version>
 
-#if __cpp_lib_filesystem >= 201703L && __has_include(<filesystem>)
+// <version> is only guaranteed to exist from c++20
+#if defined(__has_include)
+#if __has_include(<version>)
+#include <version>
+#endif
+#endif
+
+#if defined(__cpp_lib_filesystem) && __cpp_lib_filesystem >= 201703L
 #include <filesystem>
 #define JDEBUG_HAS_FILESYSTEM
 #endif

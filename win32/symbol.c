@@ -16,22 +16,22 @@ int jdebug_find_symbol(IMAGEHLP_MODULE* module_info, size_t pc, symbol_info_t* r
   struct SymbolBuffer
   {
     SYMBOL_INFO symbol;
-    char name_buf[1024];
+    char name_buf[2048];
   } symbol_buffer;
   ZeroMemory(&symbol_buffer, sizeof(symbol_buffer));
   symbol_buffer.symbol.SizeOfStruct = sizeof(SYMBOL_INFO);
   symbol_buffer.symbol.MaxNameLen   = sizeof(symbol_buffer.name_buf);
 
-  char undec_name_buf[1024];
-
   size_t displacement;
-  if (SymFromAddr(GetCurrentProcess(), pc, &displacement,
-                  &symbol_buffer.symbol)) {
-    UnDecorateSymbolName(symbol_buffer.symbol.Name, undec_name_buf, sizeof(undec_name_buf), UNDNAME_COMPLETE);
-
+  if (SymFromAddr(GetCurrentProcess(), pc, &displacement, &symbol_buffer.symbol)) {
     result->start_address = symbol_buffer.symbol.Address - module_info->BaseOfImage;
     result->displacement  = displacement;
-    result->name          = _strdup(undec_name_buf);
+
+    char undec_name_buf[4096];
+    if (UnDecorateSymbolName(symbol_buffer.symbol.Name, undec_name_buf, sizeof(undec_name_buf), UNDNAME_COMPLETE))
+      result->name = _strdup(undec_name_buf);
+    else
+      result->name = _strdup(symbol_buffer.name_buf);
 
     IMAGEHLP_LINE64 line;
     ZeroMemory(&line, sizeof(line));
@@ -304,7 +304,7 @@ static int jdebug_dwarf_find_subprog(const Dwarf_Debug dbg,
 done:
   if (err)
     dwarf_dealloc_error(dbg, err);
-  if (die)
+  if (child)
     dwarf_dealloc_die(child);
   return ret;
 }
@@ -338,13 +338,8 @@ static int jdebug_mapping_get_source_lines_die(const Dwarf_Debug dbg,
     if (dwarf_lineaddr(lines[i], &row_addr, &err))
       continue;
 
-    dwarf_lineendsequence(lines[i], &end_sequence, &err);
-    if (end_sequence)
+    if (dwarf_lineendsequence(lines[i], &end_sequence, &err) || end_sequence)
       continue;
-
-    if (dwarf_linesrc(lines[i], &src, &err)
-        || dwarf_lineno(lines[i], &lineno, &err))
-      goto done;
 
     if (row_addr <= target_addr && (!best || row_addr > best_addr)) {
       best      = lines[i];
@@ -371,7 +366,33 @@ done:
     dwarf_dealloc_error(dbg, err);
   if (src)
     dwarf_dealloc(dbg, src, DW_DLA_STRING);
-  dwarf_srclines_dealloc_b(ctx);
+  if (ctx)
+    dwarf_srclines_dealloc_b(ctx);
+  return ret;
+}
+
+// the preferred image base from the PE header, which the DWARF addresses are relative to
+static int jdebug_pe_image_base(const char* path, uint64_t* image_base)
+{
+  int ret = -1;
+
+  FILE* file = fopen(path, "rb");
+  if (!file)
+    return -1;
+
+  IMAGE_DOS_HEADER dos_header;
+  IMAGE_NT_HEADERS64 nt_headers;
+  if (1 == fread(&dos_header, sizeof(dos_header), 1, file)
+      && dos_header.e_magic == IMAGE_DOS_SIGNATURE
+      && 0 == fseek(file, dos_header.e_lfanew, SEEK_SET)
+      && 1 == fread(&nt_headers, sizeof(nt_headers), 1, file)
+      && nt_headers.Signature == IMAGE_NT_SIGNATURE
+      && nt_headers.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    *image_base = nt_headers.OptionalHeader.ImageBase;
+    ret         = 0;
+  }
+
+  fclose(file);
   return ret;
 }
 
@@ -379,12 +400,17 @@ static int jdebug_find_symbol_dwarf(IMAGEHLP_MODULE* module_info,
                                     const size_t pc,
                                     symbol_info_t* result)
 {
-  Dwarf_Debug dbg    = NULL;
-  Dwarf_Error err    = NULL;
-  Dwarf_Half version = 0;
-  int ret            = -1;
+  Dwarf_Debug dbg     = NULL;
+  Dwarf_Error err     = NULL;
+  Dwarf_Half version  = 0;
+  uint64_t image_base = 0;
+  int ret             = 0;
 
-  const size_t target_addr = pc - module_info->BaseOfImage + 0x140000000 - 1;
+  if (jdebug_pe_image_base(module_info->ImageName, &image_base))
+    return 0;
+
+  // note: -1 to look up the call instruction rather than the return address
+  const size_t target_addr = pc - module_info->BaseOfImage + image_base - 1;
 
   if (dwarf_init_path(module_info->ImageName, NULL, 0, DW_GROUPNUMBER_ANY, NULL, NULL, &dbg, &err))
     goto done;
@@ -403,8 +429,13 @@ static int jdebug_find_symbol_dwarf(IMAGEHLP_MODULE* module_info,
                                  NULL,
                                  &err)) {
     Dwarf_Die die = NULL;
-    if (dwarf_siblingof_b(dbg, NULL, 1, &die, &err))
+    if (dwarf_siblingof_b(dbg, NULL, 1, &die, &err)) {
+      if (err) {
+        dwarf_dealloc_error(dbg, err);
+        err = NULL;
+      }
       continue;
+    }
 
     if (!jdebug_dwarf_die_in_range(dbg, die, target_addr)) {
       dwarf_dealloc_die(die);
@@ -413,19 +444,18 @@ static int jdebug_find_symbol_dwarf(IMAGEHLP_MODULE* module_info,
 
     Dwarf_Addr prog_low = 0;
     char* prog_name     = NULL;
-    ret                 = jdebug_dwarf_find_subprog(dbg, die, target_addr, &prog_low, &prog_name);
-    if (!ret) {
+    if (!jdebug_dwarf_find_subprog(dbg, die, target_addr, &prog_low, &prog_name)) {
       dwarf_dealloc_die(die);
-      break;
+      continue;
     }
 
-    result->start_address = prog_low - 0x140000000;
-    result->displacement  = target_addr - prog_low;
+    result->start_address = prog_low - image_base;
+    result->displacement  = target_addr + 1 - prog_low;
     result->name          = prog_name;
 
     char* source_file    = NULL;
     uint64_t source_line = 0;
-    if (jdebug_mapping_get_source_lines_die(dbg, die, target_addr, &source_file, &source_line)) {
+    if (jdebug_mapping_get_source_lines_die(dbg, die, target_addr, &source_file, &source_line) > 0) {
       result->filename = source_file;
       result->line     = source_line;
     } else {
@@ -434,11 +464,14 @@ static int jdebug_find_symbol_dwarf(IMAGEHLP_MODULE* module_info,
     }
 
     dwarf_dealloc_die(die);
+    ret = 1;
+    break;
   }
 
 done:
   if (dbg) {
-    dwarf_dealloc_error(dbg, err);
+    if (err)
+      dwarf_dealloc_error(dbg, err);
     dwarf_finish(dbg);
   }
   return ret;

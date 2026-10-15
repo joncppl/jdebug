@@ -2,7 +2,7 @@ compiler = meson.get_compiler('c')
 
 libunwind = dependency('libunwind-generic', required : false)
 if not libunwind.found()
-    libunwind = compiler.find_library('libunwind-generic', required : true)
+    libunwind = compiler.find_library('unwind-generic', required : true)
 endif
 
 libdwarf = dependency('libdwarf', required : false)
@@ -23,12 +23,12 @@ sources = [
 ]
 c_args = ['-D_GNU_SOURCE=1', '-fvisibility=hidden', '-std=gnu11']
 
-if get_option('examples').enabled()
+if get_option('cxx_exceptions').enabled()
     sources += 'print_exception.cpp'
     c_args += '-DJDEBUG_PRINT_EXCEPTION=1'
 endif
 
-jdebug_lib = library(
+jdebug_lib = static_library(
     'jdebug',
     sources,
     dependencies : [libunwind, libdwarf],
